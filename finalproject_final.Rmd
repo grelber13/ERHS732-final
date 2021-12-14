@@ -1,0 +1,401 @@
+---
+title: "ERHS732 final project"
+author: "Grace Kuiper"
+date: "12/08/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(splines)
+library(survival)
+library(broom)
+library(ggplot2)
+library(survminer)
+library(kableExtra)
+
+setwd("C:/Users/grelber/Documents/ERHS732/Final project")
+annual_df<-read.csv("tdc.data.csv",stringsAsFactors = F)
+total_df<-read.csv("fixedeffects.data.csv", stringsAsFactors = F)
+
+```
+
+## Background
+
+Data are publicly available through [Dryad](https://datadryad.org/stash/dataset/doi:10.5061%2Fdryad.q3v30) for "Stronger social bonds do not always predict greater longevity in a gregarious primate" publication (Thompson and Cords, 2018). For this publication, Thompson and Cords conducted survival analyses to understand the association between measures of sociability and mortality among blue monkeys in Kenya. Using these data, the analysis described here will attempt to answer two follow-up research questions which expand on the original results presented by Thompson and Cords. 
+
+![](Blue_monkeys.jpg){#id .class width=50% height=50%}
+
+## Introduction
+
+In this investigation, blue monkey groups were observed for 9 years to understand the impact of sociability on survival. Among humans and non-human species that demonstrate strong social ties, bonding can be an important factor for longevity, offspring survival, and reproductive rate. Together, these are indicators of fitness.
+
+Social measures collected by Thompson and Cords that are available in their publicly available dataset include bond strength and partner consistency. These were evaluated among each female dyad on an annual basis. For each subject, the bond strength and partner consistency scores for her top three and top six closest partners were averaged. Other available demographic and environmental factors include each subject's start age and age at censorship, mortality outcome, age at first reproduction, dominance rank, and the number of female groupmates.
+
+For time-varying data, subjects' social and environmental factors were annually for each study year during which they were observed:
+
+```{r same-year data, echo=F}
+head(annual_df %>%
+       rename(Subject=subj,
+              Death=death,
+              `Age at year start`=start.age,
+              `Age at year end or censorship`=stop.age,
+              `Bond strength - 3 closest partners`=strength.3,
+              `Bond strength - 6 closest partners`=strength.6,
+              `Consistency - 3 closest partners`=cons.p3,
+              `Consistency - 6 closest partners`=cons.p6,
+              `Dominance rank`=rank,
+              `Number of groupmates`=af.groupmates) %>%
+       select(-a.st.co3,-a.st.co6,-period))%>%
+  kable(format = "html") %>%
+  kable_styling() %>%
+  column_spec(1:10, width_min = "150px") %>%
+  kableExtra::scroll_box(width = "100%")
+```
+<div style="margin-bottom:50px;">
+</div>
+
+In their analysis, Thompson and Cords categorized individuals into one of four groups based on both their bond strength and partner consistency: +/+ (bond strength and consistency above the mean), +/- (bond strength above the mean, consistency below the mean), -/+, and -/-. In both same-year and multi-year models, belonging to the +/- group was found to be the most hazardous for mortality (multi-year HR [referent = +/+], 95% CI: 20.3, 3.4-123). The authors hypothesize that these findings indicate a costliness for female blue monkeys to be part of a strongly-bonded partnership. Females that become highly invested in an inconsistent dyad are at a disadvantage.
+
+## Research question
+
+#### Does a decrease in partnership consistency over the previous year affect the likelihood of mortality for female blue monkeys?
+In light of Thompson and Cords' findings, do individuals who experience a change in closest partnerships, as indicated by a decrease in consistency score from lagges years, experience increased mortality risk as compared to those whose partnership consistency stays the same or increases.
+
+## Methods
+
+#### Simple approach
+Here the time-varying dataset will be used. A new variable will be created which indicates a decrease in partnership consistency from the previous year versus partnership consistency that stayed the same or increased. This new indicator variable will be added to the model fit by Thompson and Cords, which included each subject's social category (+/+, +/-, -/+, or -/-), the number of female groupmates, and their dominance rank during each year of observation.
+
+```{r model example #1, eval=F, echo=T}
+coxph_mod1 <- coxph(Surv(start.age, stop.age, death) ~ as.factor(soc.cat) + no.groupmates + rank + 
+                      as.factor(cons.decrease),
+                    data=annual_df)
+```
+
+#### Time-varying IPW approach
+The association between potential confounders and the exposure of interest (loss in partner consistency) will be evaluated. Those that are imbalanced across exposure groups, as well as age at study entry as a time-invariant covariate will be used to predict propensity scores of rloss in partner consistency. Cumulative product inverse probability weights will be calculated for each subject. If necessary, a numerator model will be fit to stabilize the IPWs. A Cox proportional hazards model will be fit with any covariates included in the numerator model, as well as the consistency loss exposure variable. This model will include the cumulative product IPW as the `weights` option and subject ID for a `cluster` effect.
+
+## Results
+
+### Data exploration
+
+```{r data exploration, echo=F, warning=F}
+example_subjects <- total_df[c(1,9,17,25,33,41,49,57,65,73,81),]$subj
+bar_df <- data.frame(subj="daff",max=27,min=5)
+total_df %>% 
+  filter(subj %in% example_subjects) %>% 
+  select(subj, entry.years,censor.years, death) %>% 
+  left_join(annual_df %>%
+              filter(subj %in% example_subjects) %>%
+              select(period,subj,start.age) %>%
+              pivot_wider(names_from="period",
+                          values_from="start.age"),
+            by=c("subj")) %>%
+  pivot_longer(p2:p6,names_to="year",values_to="start.age") %>%
+  mutate(start.age=start.age/365.25,
+         year=gsub("p","",year),
+         subj = as_factor(subj), 
+         subj = fct_reorder(subj, censor.years),  # Arrange by time to death
+         death = as_factor(death)) %>% 
+  ggplot() + 
+  geom_segment(aes(x = entry.years, xend = censor.years, 
+                   y = subj, yend = subj), color = "darkgray") + 
+  geom_point(aes(x = censor.years, y = subj, fill = death), shape = 22) + 
+  geom_point(aes(x = start.age, y = subj, color = year)) + 
+  geom_point(aes(x=entry.years,y=subj),color="darkgray") +
+  geom_segment(data=bar_df,aes(x=min,xend=max,
+                               y=subj,yend=subj),
+           color="yellow",alpha=0.2,size=10) +
+  theme_classic() + 
+  labs(x = "Time since first examination (years)", 
+       y = "Subject ID", 
+       color = "Start of\nobservation year") +
+  scale_fill_manual(name = "", values = c("white", "black"), 
+                    labels = c("Survived\nfollow-up", "Died during\nfollow-up")) #+
+  # scale_x_continuous(breaks=c(10,15,20,25)) +
+  # xlim(5, 27)
+
+cat("There were ",nrow(total_df %>% filter(death==1))," deaths among the cohort over the course of this study.")
+
+breaks_fun <- function(y) {
+  if (max(y) > 3) {
+    seq(0, 2,4,6,8)
+  } else {
+    seq(0, 1,2,3)
+  }
+}
+total_df %>% 
+  rename(`Bond strength among 3 closest partners`=strength.3) %>%
+  mutate(Death=ifelse(death==1,"Died during follow-up",
+                      "Survived follow-up")) %>%
+  ggplot(aes(x = `Bond strength among 3 closest partners`)) + 
+  geom_histogram(aes(fill=Death),color="black",bins=25) + 
+  facet_wrap(~ Death, ncol = 1, scale = "free_y") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_y_continuous(breaks = function(x) 
+    unique(floor(pretty(seq(0,(max(x) + 1) * 1.1)))))
+
+total_df %>% 
+  rename(`Consistency among 3 closest partners`=cons.3) %>%
+  mutate(Death=ifelse(death==1,"Died during follow-up",
+                      "Survived follow-up")) %>%
+  ggplot(aes(x = `Consistency among 3 closest partners`)) + 
+  geom_histogram(aes(fill=Death),color="black",bins=25) + 
+  facet_wrap(~ Death, ncol = 1, scale = "free_y") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_y_continuous(breaks = function(x) 
+    unique(floor(pretty(seq(0,(max(x) + 1) * 1.1)))))
+
+#Survival curve grouped by above vs. below mean of consistency among 3 closest partners
+cons.3_mean <- mean(total_df$cons.3)
+total_df <- total_df %>%
+  mutate(cons.3_cat = ifelse(cons.3>cons.3_mean,"High","Low")) 
+total_df$cons.3_cat<-factor(total_df$cons.3_cat,levels=c("High","Low"))
+
+fit_age_cons <- survfit(Surv(entry.years,censor.years,death) ~ cons.3_cat,
+                        data = total_df)
+fit_age_cons %>%
+  ggsurvplot(xlab = "Age (years)",
+             ylab = expression(paste('Overall Survival Probablity  ',
+                                     hat(S) * "(t)")),
+             legend.labs = c("High","Low"),
+             legend.title = "Multi-year partner consistency")
+
+#Survival curve grouped by above vs. below mean of bond strength among 3 closest partners
+strength.3_mean <- mean(total_df$strength.3)
+total_df <- total_df %>%
+  mutate(strength.3_cat = ifelse(strength.3>strength.3_mean,"High","Low")) 
+total_df$strength.3_cat<-factor(total_df$strength.3_cat,levels=c("High","Low"))
+
+fit_age_strength <- survfit(Surv(entry.years,censor.years,death) ~
+                          strength.3_cat,
+                        data = total_df)
+fit_age_strength %>%
+  ggsurvplot(xlab = "Age (years)",
+             ylab = expression(paste('Overall Survival Probablity  ',
+                                     hat(S) * "(t)")),
+             legend.labs = c("High","Low"),
+             legend.title = "Multi-year bond strength")
+
+#Survival curve grouped by four social categories
+total_df <- total_df %>%
+  mutate(social_cat = ifelse(st.co3==1,"-/-",
+                             ifelse(st.co3==2,"-/+",
+                                    ifelse(st.co3==3,"+/-","+/+")))) 
+total_df$social_cat<-factor(total_df$social_cat,
+                            levels=c("-/-","-/+","+/-","+/+"))
+
+fit_age_cat <- survfit(Surv(entry.years,censor.years,death) ~
+                          social_cat,
+                        data = total_df)
+fit_age_cat %>%
+  ggsurvplot(xlab = "Age (years)",
+             ylab = expression(paste('Overall Survival Probablity  ',
+                                     hat(S) * "(t)")),
+             legend.labs = c("-/-","-/+","+/-","+/+"),
+             legend.title = "Social category (strength/consistency)")
+
+```
+
+### Simple approach
+A new variable was be created to indicate a decrease in partnership consistency from the previous year versus partnership consistency that stayed the same or increased. This new indicator variable was be added to the model fit by Thompson and Cords.
+
+```{r data prep, echo=F, warning=F}
+annual_df_mod1 <- annual_df %>%
+  group_by(subj) %>%
+  mutate(cons.p3_lag=lag(cons.p3,1),
+         cons.p6_lag=lag(cons.p6,1)) %>%
+  mutate(cons.p3_loss=ifelse(cons.p3<cons.p3_lag,1,0),
+         cons.p6_loss=ifelse(cons.p6<cons.p6_lag,1,0))
+annual_df_mod1$cons.p3_loss <- as.factor(annual_df_mod1$cons.p3_loss)
+annual_df_mod1$cons.p6_loss <- as.factor(annual_df_mod1$cons.p6_loss)
+annual_df_mod1$a.st.co3=relevel(as.factor(annual_df_mod1$a.st.co3),ref=4)
+annual_df_mod1$a.st.co6=relevel(as.factor(annual_df_mod1$a.st.co6),ref=4)
+
+annual_df_ps <- annual_df_mod1 %>%
+  left_join(total_df %>%
+              select(entry.years,censor.years,subj),
+            by="subj") %>%
+  mutate(entry.days=entry.years*365.25,
+         censor.days=censor.years*365.25,
+         time=start.age-entry.days,
+         time2=lead(time)-1,
+         time2=ifelse(is.na(time2),censor.days-entry.days,time2)) %>%
+  select(-entry.days,-censor.days,-censor.years) %>%
+  group_by(subj) %>%
+  mutate(rank_l1=lag(rank),
+         af.groupmates_l1=lag(af.groupmates),
+         a.st.co3_l1=lag(a.st.co3)) %>%
+  ungroup() %>%
+  filter(!is.na(cons.p3_loss))
+```
+```{r simple approach, echo=T}
+coxph_mod1 <- coxph(Surv(time, time2, death) ~ 
+                      a.st.co3 + af.groupmates + rank + 
+                      entry.years + cons.p3_loss,
+                    data=annual_df_ps)
+```
+```{r simple approach output, echo=F, warning=F,}
+coxph_mod1 %>% 
+  tidy() %>% 
+  mutate(hr = exp(estimate),
+         low_ci = (estimate - 1.96 * std.error), 
+         high_ci = (estimate + 1.96 * std.error), 
+         low_hr = exp(low_ci), 
+         high_hr = exp(high_ci)) %>% 
+  select(term, hr, low_hr, high_hr)
+phtest <- cox.zph(coxph_mod1)
+phtest
+```
+### Time-varying IPW approach
+
+Let’s start by checking whether number of groupmates and dominance ranke are, in fact, associated with exposures (partnership consistency and bond strength).
+
+#### Are the confounders associated with the exposures?
+
+```{r rank associated exp, echo=F, warning=F, message=F}
+annual_df_mod1 %>% 
+  filter(!is.na(cons.p3_loss)) %>%
+  mutate(`Partner consistency`=ifelse(cons.p3_loss==1,"Loss since previous year", "No change or increase since previous year")) %>%
+  rename(`Dominance rank`=rank) %>%
+  ggplot(aes(x = `Dominance rank`)) + 
+  geom_histogram(aes(fill=cons.p3_loss),color="black") + 
+  facet_wrap(~ `Partner consistency`, ncol = 1,
+             scales="free_y") +
+  theme_bw() +
+  theme(legend.position = "none")
+  
+annual_df_mod1 %>% 
+  filter(!is.na(cons.p3_loss)) %>%
+  ungroup() %>%
+  select(rank,cons.p3_loss) %>%
+  summarize(mean_rank_loss = mean(rank[cons.p3_loss == 1]), 
+            mean_rank_noloss = mean(rank[cons.p3_loss == 0]), 
+            sd_rank = sd(rank)) %>% 
+  mutate(stand_diff_rank = abs(mean_rank_loss - mean_rank_noloss) / sd_rank) %>% 
+  pivot_longer(everything())
+```
+Since the standardized mean difference is >0.1, there is an imbalance in rank across the exposure groups (loss vs. no loss in partner consistency).
+
+```{r number of groupmates associated exp, echo=F, warning=F,message=F}
+annual_df_mod1 %>% 
+  filter(!is.na(cons.p3_loss)) %>%
+  mutate(`Partner consistency`=ifelse(cons.p3_loss==1,"Loss since previous year", "No change or increase since previous year")) %>%
+  rename(`Number of groupmates`=af.groupmates) %>%
+  ggplot(aes(x = `Number of groupmates`)) + 
+  geom_histogram(aes(fill=cons.p3_loss),color="black") + 
+  facet_wrap(~ `Partner consistency`, ncol = 1,
+             scales="free_y") +
+  theme_bw() +
+  theme(legend.position = "none")
+annual_df_mod1 %>% 
+  filter(!is.na(cons.p3_loss)) %>%
+  ungroup() %>%
+  select(af.groupmates,cons.p3_loss) %>%
+  summarize(mean_groupmates_loss = mean(af.groupmates[cons.p3_loss == 1]), 
+            mean_groupmates_noloss = mean(af.groupmates[cons.p3_loss == 0]), 
+            sd_groupmates = sd(af.groupmates)) %>% 
+  mutate(stand_diff_groupmates = abs(mean_groupmates_loss - mean_groupmates_noloss) / sd_groupmates) %>% 
+  pivot_longer(everything())
+```
+
+So number of groupmates is not imbalanced across exposure groups.
+
+```{r social category associated exp, echo=F, warning=F, message=F}
+annual_df_mod1 %>% 
+  filter(!is.na(cons.p3_loss)) %>%
+  group_by(cons.p3_loss) %>% 
+  summarize(n_negneg = sum(a.st.co3 == 1), 
+            n_posneg = sum(a.st.co3 == 2), 
+            n_negpos = sum(a.st.co3 == 3),
+            n_pospos = sum(a.st.co3 == 4),
+            perc_negneg = n_negneg / n(),
+            perc_posneg = n_posneg / n(),
+            perc_negpos = n_negpos / n(),
+            perc_pospos = n_pospos / n())
+
+##a.st.co3: 1=-(cons)/-(strength)
+##          2=+/-
+##          3=-/+
+##          4=+/+
+```
+The social categories are very imbalanced across exposure groups.
+
+#### Estimating propensity scores
+
+```{r propensity scores, echo=T}
+model_ps <- glm(cons.p3_loss ~ ns(time,df=2) + entry.years + rank_l1 + af.groupmates_l1 +
+                  a.st.co3_l1, 
+                family = "binomial", data = annual_df_ps)
+```
+```{r propensity scores output, echo=FALSE, warning=F, message=F}
+model_ps %>% 
+  tidy()
+```
+
+#### Calculating IPWs
+
+```{r IPW prep, echo=F, warning=F, message=F}
+annual_df_ps <- annual_df_ps %>%
+  mutate(ps=predict(model_ps, type = "response"),
+         w_i=if_else(cons.p3_loss==1,1/ps,1/(1-ps))) %>%
+  group_by(subj) %>%
+  mutate(w=cumprod(w_i)) %>%
+  ungroup()
+
+annual_df_ps %>%
+  summarize(`Mean cumulative product IPW` = mean(w),
+            `Minimum cumulative product IPW` = min(w),
+            `Maximum cumulative product IPW` = max(w),
+            `Sum cumulative product IPW` = sum(w))
+```
+
+#### Fitting numerator model and calculate stabilized IPW
+```{r numerator model, echo=T}
+mod_IPWnum_2 <- glm(cons.p3_loss ~ ns(time, df = 2) + entry.years +a.st.co3_l1, 
+                    family = "binomial", data = annual_df_ps)
+```
+```{r numerator model output, echo=F, warning=F, message=F}
+mod_IPWnum_2 %>%
+  tidy()
+annual_df_ps <- annual_df_ps %>%
+  mutate(ps_new_2=predict(mod_IPWnum_2,type="response"),
+         w_i_new_2=ifelse(cons.p3_loss==1,ps_new_2/ps,(1-ps_new_2)/(1-ps))) %>%
+  group_by(subj) %>%
+  mutate(w_new_2=cumprod(w_i_new_2)) %>%
+  ungroup()
+
+annual_df_ps %>%
+  summarize(`Mean stabilized IPW` = mean(w_new_2),
+            `Minimum stabilized IPW`=min(w_new_2),
+            `Maximum stabilized IPW`=max(w_new_2),
+            `Sum stabilized IPW`=sum(w_new_2))
+```
+
+#### Cox proportional hazards model
+``` {r Cox PH model, echo=T}
+coxph_modIPW_tv <- coxph(Surv(time,time2,death) ~
+                           cons.p3_loss + entry.years + a.st.co3_l1,
+                         weights=w_new_2, cluster=subj,
+                         data=annual_df_ps)
+```
+```{r Cox PH model output, echo=F, warning=F, message=F}
+coxph_modIPW_tv %>%
+  tidy()
+
+coxph_modIPW_tv %>% 
+  tidy() %>% 
+  mutate(hr = exp(estimate),
+         low_ci = (estimate - 1.96 * robust.se), 
+         high_ci = (estimate + 1.96 * robust.se), 
+         low_hr = exp(low_ci), 
+         high_hr = exp(high_ci)) %>% 
+  select(term, hr, low_hr, high_hr)
+phtest <- cox.zph(coxph_modIPW_tv)
+phtest
+```
+"The correct interpretation of this HR is as the effect of exposure in the exposed. In other words it is the HR comparing what would have happened if the exposed were exposed (what actually happened) to what would have happened if the exposed were unexposed. By contrast remember that the interpretation of the HR in the case of IPW was the HR comparing what would have happened if everyone was exposed to what would have happened if nobody was exposed."
